@@ -12,7 +12,7 @@ import aiohttp
 from config import (
     DB_PATH, ENTITY_FLOW_RATE, ENTITY_HEATING, ENTITY_INLET_TEMP,
     ENTITY_OUTLET_TEMP, ENTITY_RECIRC, HA_TOKEN, HA_URL, POLL_INTERVAL_SEC,
-    FLOW_THRESHOLD_GPM,
+    FLOW_THRESHOLD_GPM, RECIRC_SCHEDULE,
 )
 
 
@@ -82,6 +82,12 @@ class UsageTracker:
     INLET_COLD_THRESHOLD = 110.0   # Below this during flow = cold water entering
     FLOW_VARIANCE_THRESHOLD = 0.3  # GPM std dev — recirc is rock-steady
 
+    # Inlet drop thresholds for demand detection during schedule windows.
+    # Real demand (shower/faucet) pulls cold supply water, crashing inlet
+    # 40-60F from a warm loop. Recirc reheating barely moves it.
+    INLET_DROP_THRESHOLD = 30.0    # Pre-flow minus min-during-flow
+    PRE_FLOW_WARM = 100.0          # Pre-flow inlet must be warm for drop to count
+
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
         self.in_event = False
@@ -90,19 +96,26 @@ class UsageTracker:
         self.flow_samples: list[float] = []
         self.inlet_samples: list[float] = []
         self.heating_samples: list[int] = []
+        self.pre_flow_inlet: float | None = None
+        self._last_idle_inlet: float | None = None  # tracks inlet when no flow
 
     def update(self, now: datetime, flow_rate: float,
                inlet_temp: float | None = None,
                heating: int | None = None,
                recirc_on: bool = False):
+        # Track inlet temp when idle (no flow) for pre-flow baseline
+        if flow_rate < FLOW_THRESHOLD_GPM and inlet_temp is not None:
+            self._last_idle_inlet = inlet_temp
+
         if flow_rate >= FLOW_THRESHOLD_GPM and not self.in_event:
-            # Flow started
+            # Flow started — snapshot pre-flow inlet
             self.in_event = True
             self.event_start = now
             self.peak_flow = flow_rate
             self.flow_samples = [flow_rate]
             self.inlet_samples = [inlet_temp] if inlet_temp is not None else []
             self.heating_samples = [heating] if heating is not None else []
+            self.pre_flow_inlet = self._last_idle_inlet
 
         elif flow_rate >= FLOW_THRESHOLD_GPM and self.in_event:
             # Flow continuing — accumulate samples
@@ -146,6 +159,8 @@ class UsageTracker:
             details = []
             if fixture_type:
                 details.append(fixture_type)
+            if self.pre_flow_inlet is not None:
+                details.append(f"pre={self.pre_flow_inlet:.0f}F")
             if self.inlet_samples:
                 details.append(f"inlet={min(self.inlet_samples):.0f}-{max(self.inlet_samples):.0f}F")
             if self.heating_samples:
@@ -162,14 +177,60 @@ class UsageTracker:
                   f"{duration:.0f}s | peak {self.peak_flow:.1f} GPM | "
                   f"avg {avg_flow:.1f} GPM{detail_str}")
 
+    # Flow rates that clearly indicate a fixture, not the pump.
+    # The recirc pump runs at 2.7-3.2 GPM. Anything well below that
+    # during a schedule window is a real fixture (shower ~1.4, faucet varies).
+    PUMP_FLOW_MIN = 2.5  # Below this = not the pump
+
+    def _in_recirc_schedule(self, dt: datetime) -> bool:
+        """Check if a timestamp falls within a configured recirc schedule window."""
+        from datetime import timedelta, timezone
+        local = dt.astimezone(timezone(timedelta(hours=-5)))  # CDT
+        dow = local.weekday()  # 0=Mon
+        t = local.hour * 60 + local.minute
+
+        for days, sh, sm, eh, em in RECIRC_SCHEDULE:
+            if dow in days:
+                start = sh * 60 + sm
+                end = eh * 60 + em
+                if start <= t < end:
+                    return True
+        return False
+
     def _classify(self) -> str:
         """Classify a completed flow event as 'demand' or 'recirc'.
 
-        Uses three signals (any one is sufficient for demand):
-        1. Inlet temp dropped below threshold → cold water entering → demand
-        2. Burner fired (heating=1) at any point → demand
-        3. Flow rate variance is high → faucet/shower fluctuation → demand
+        Classification strategy:
+        1. If we're in a recirc schedule window, default to 'recirc' UNLESS:
+           a. Flow rate is clearly non-pump (< 2.5 GPM avg = shower/faucet), OR
+           b. Inlet temp crashed from a warm pre-flow baseline (someone drew
+              water, cold supply entering — the pump alone doesn't do this
+              when the loop was already warm).
+        2. Outside schedule windows, use the multi-signal approach:
+           inlet temp, heating state, and flow variance.
         """
+        avg_flow = sum(self.flow_samples) / len(self.flow_samples)
+
+        # Schedule-aware classification
+        if self.event_start and self._in_recirc_schedule(self.event_start):
+            # Signal A: Flow rate clearly below pump rate
+            if avg_flow < self.PUMP_FLOW_MIN:
+                return "demand"
+
+            # Signal B: Inlet temp crashed from warm baseline
+            # Real demand: pre-flow 115F → min 60F (drop 55F)
+            # Recirc reheat: pre-flow 110F → min 105F (drop 5F)
+            if (self.pre_flow_inlet is not None
+                    and self.pre_flow_inlet >= self.PRE_FLOW_WARM
+                    and self.inlet_samples):
+                min_inlet = min(self.inlet_samples)
+                drop = self.pre_flow_inlet - min_inlet
+                if drop >= self.INLET_DROP_THRESHOLD:
+                    return "demand"
+
+            return "recirc"
+
+        # Outside schedule: use sensor signals (any one = demand)
         # Signal 1: Cold water entering
         if self.inlet_samples:
             min_inlet = min(self.inlet_samples)

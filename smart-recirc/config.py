@@ -24,3 +24,22 @@ POLL_INTERVAL_SEC = 30            # How often to poll HA for sensor data
 # Data collection
 DB_PATH = "smart_recirc.db"
 MIN_TRAINING_DAYS = 3             # Minimum days of data before enabling predictions
+
+# Rinnai recirc schedule — windows when the pump cycles automatically.
+# During these windows, flow events default to "recirc" unless flow rate
+# clearly indicates a fixture (e.g., shower at 1.4 GPM).
+# Format: list of (days, start_hour, start_min, end_hour, end_min)
+# Days: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
+RECIRC_SCHEDULE = [
+    # Monday-Friday
+    ((0, 1, 2, 3, 4), 4, 45, 9, 0),
+    ((0, 1, 2, 3, 4), 12, 0, 13, 0),
+    ((0, 1, 2, 3, 4), 16, 30, 21, 30),
+    # Saturday
+    ((5,), 4, 0, 8, 0),
+    ((5,), 14, 0, 16, 0),
+    # Sunday
+    ((6,), 4, 0, 8, 0),
+    ((6,), 8, 30, 16, 0),   # 08:30-15:00 + 14:00-16:00 merged
+    ((6,), 17, 0, 19, 0),
+]
