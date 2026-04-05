@@ -1,19 +1,182 @@
-"""Collects hot water usage data from Home Assistant and stores it locally."""
+"""Collects hot water usage data directly from Rinnai Cloud API."""
 
 from __future__ import annotations
 
-import asyncio
+import json
 import sqlite3
 import time
+import urllib.request
 from datetime import datetime, timezone
 
-import aiohttp
+import boto3
 
 from config import (
-    DB_PATH, ENTITY_FLOW_RATE, ENTITY_HEATING, ENTITY_INLET_TEMP,
-    ENTITY_OUTLET_TEMP, ENTITY_RECIRC, HA_TOKEN, HA_URL, POLL_INTERVAL_SEC,
-    FLOW_THRESHOLD_GPM, RECIRC_SCHEDULE,
+    DB_PATH, FLOW_RAW_DIVISOR, FLOW_THRESHOLD_GPM, POLL_INTERVAL_SEC,
+    RECIRC_SCHEDULE, RINNAI_API_KEY, RINNAI_EMAIL, RINNAI_GRAPHQL_URL,
+    RINNAI_PASSWORD, RINNAI_SHADOW_URL, RINNAI_THING_NAME,
 )
+
+# Cognito config
+_COGNITO_CLIENT_ID = "5ghq3i6k4p9s7dfu34ckmec91"
+_COGNITO_REGION = "us-east-1"
+
+# GraphQL query — pulls sensor data and shadow state in one call
+_SENSOR_QUERY = """
+query GetUserByEmail($email: String) {
+  getUserByEmail(email: $email) {
+    items {
+      devices {
+        items {
+          info {
+            m01_water_flow_rate_raw
+            m08_inlet_temperature
+            m02_outlet_temperature
+            domestic_combustion
+          }
+          shadow {
+            recirculation_enabled
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+_GQL_HEADERS = {
+    "x-amz-user-agent": "aws-amplify/3.4.3 react-native",
+    "x-api-key": RINNAI_API_KEY,
+    "Content-Type": "application/json",
+}
+
+
+class RinnaiClient:
+    """Handles auth, maintenance retrieval, and sensor reads against Rinnai Cloud API."""
+
+    def __init__(self):
+        self._id_token: str | None = None
+        self._token_expires: float = 0.0
+        self._last_maintenance: float = 0.0
+        self._maint_interval: float = 60.0  # seconds between maintenance retrievals
+
+    def _authenticate(self):
+        """Get a fresh Cognito ID token via USER_PASSWORD_AUTH."""
+        client = boto3.client(
+            "cognito-idp", region_name=_COGNITO_REGION,
+            aws_access_key_id="dummy", aws_secret_access_key="dummy",
+        )
+        resp = client.initiate_auth(
+            ClientId=_COGNITO_CLIENT_ID,
+            AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={
+                "USERNAME": RINNAI_EMAIL,
+                "PASSWORD": RINNAI_PASSWORD,
+            },
+        )
+        result = resp["AuthenticationResult"]
+        self._id_token = result["IdToken"]
+        self._token_expires = time.time() + result["ExpiresIn"] - 300  # refresh 5 min early
+
+    def _ensure_auth(self):
+        if self._id_token is None or time.time() >= self._token_expires:
+            self._authenticate()
+            print("[AUTH] Rinnai token refreshed")
+
+    def _do_maintenance_retrieval(self):
+        """Tell the device to push fresh sensor data to the cloud."""
+        now = time.time()
+        if now - self._last_maintenance < self._maint_interval:
+            return
+
+        self._ensure_auth()
+        url = RINNAI_SHADOW_URL % RINNAI_THING_NAME
+        data = json.dumps({"do_maintenance_retrieval": True}).encode()
+        req = urllib.request.Request(url, data=data, method="PATCH", headers={
+            "User-Agent": "okhttp/3.12.1",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Bearer {self._id_token}",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=15):
+                self._last_maintenance = now
+        except Exception as e:
+            print(f"[WARN] Maintenance retrieval failed: {e}")
+
+    def start_recirculation(self, duration: int = 5):
+        """Start the recirc pump for the given duration in minutes."""
+        self._ensure_auth()
+        url = RINNAI_SHADOW_URL % RINNAI_THING_NAME
+        data = json.dumps({
+            "recirculation_duration": str(duration),
+            "set_recirculation_enabled": True,
+        }).encode()
+        req = urllib.request.Request(url, data=data, method="PATCH", headers={
+            "User-Agent": "okhttp/3.12.1",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Bearer {self._id_token}",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=15):
+                print(f"[RECIRC] Started for {duration} min via Rinnai API")
+                return True
+        except Exception as e:
+            print(f"[RECIRC] Failed to start: {e}")
+            return False
+
+    def fetch_sensors(self) -> dict | None:
+        """Trigger maintenance retrieval then fetch fresh sensor values.
+
+        Returns dict with keys: flow_rate, inlet_temp, outlet_temp, heating, recirc_on
+        Returns None on error.
+        """
+        self._do_maintenance_retrieval()
+
+        payload = json.dumps({
+            "query": _SENSOR_QUERY,
+            "variables": {"email": RINNAI_EMAIL},
+        }).encode()
+
+        req = urllib.request.Request(
+            RINNAI_GRAPHQL_URL, data=payload, headers=_GQL_HEADERS, method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+        except Exception as e:
+            print(f"[WARN] Rinnai API fetch failed: {e}")
+            return None
+
+        try:
+            device = data["data"]["getUserByEmail"]["items"][0]["devices"]["items"][0]
+            info = device["info"]
+            shadow = device["shadow"]
+        except (KeyError, IndexError) as e:
+            print(f"[WARN] Rinnai API response parse error: {e}")
+            return None
+
+        flow_raw = _safe_float(info.get("m01_water_flow_rate_raw"))
+        inlet = _safe_float(info.get("m08_inlet_temperature"))
+        outlet = _safe_float(info.get("m02_outlet_temperature"))
+        combustion = info.get("domestic_combustion")
+        recirc = shadow.get("recirculation_enabled")
+
+        return {
+            "flow_rate": flow_raw / FLOW_RAW_DIVISOR if flow_raw is not None else None,
+            "inlet_temp": inlet,
+            "outlet_temp": outlet,
+            "heating": 1 if combustion in (True, "true") else 0,
+            "recirc_on": 1 if recirc in (True, "true") else 0,
+        }
+
+
+def _safe_float(val) -> float | None:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
 
 
 def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
@@ -78,18 +241,26 @@ class UsageTracker:
     Demand signature: inlet drops (cold water entering), heating fires, flow varies.
     """
 
-    # Classification thresholds
-    INLET_COLD_THRESHOLD = 110.0   # Below this during flow = cold water entering
-    FLOW_VARIANCE_THRESHOLD = 0.3  # GPM std dev — recirc is rock-steady
-
-    # Inlet drop thresholds for demand detection during schedule windows.
-    # Real demand (shower/faucet) pulls cold supply water, crashing inlet
-    # 40-60F from a warm loop. Recirc reheating barely moves it.
-    INLET_DROP_THRESHOLD = 30.0    # Pre-flow minus min-during-flow
+    # Classification thresholds — tuned from 2 weeks of data (513 events)
+    #
+    # Pump flow: 2.5-3.3 GPM (floor 2.5, 99% at 2.6+). Runs slow at 2.0-2.5
+    # sometimes but always with small drop and short gap from prior recirc.
+    # Real fixtures: 0.1-2.0 GPM (faucet/shower). Baths overlap at 2.2-2.5.
+    #
+    # Key discriminator: inlet temp drop from pre-flow baseline.
+    # - Recirc between-cycle cooldown: 0-15F drop
+    # - Pump cold-start after long gap: big drop but pre-flow already cold (<80F)
+    # - Real demand: >20F drop from warm pre-flow (>=100F)
+    PUMP_FLOW_MIN = 2.0            # Below this = definitely a fixture
+    PUMP_FLOW_AMBIG = 2.5          # 2.0-2.5 GPM = ambiguous zone, needs drop signal
+    INLET_DROP_THRESHOLD = 20.0    # Pre-flow minus min-during-flow
     PRE_FLOW_WARM = 100.0          # Pre-flow inlet must be warm for drop to count
+    PRE_FLOW_COLD = 80.0           # Below this = pipes fully cooled (ambient)
+    LONG_GAP_MIN = 60              # Minutes — gap > this = schedule restart
 
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: sqlite3.Connection, on_demand=None):
         self.conn = conn
+        self.on_demand = on_demand  # callback(event_type, fixture_type, duration, avg_flow, details)
         self.in_event = False
         self.event_start: datetime | None = None
         self.peak_flow = 0.0
@@ -97,7 +268,10 @@ class UsageTracker:
         self.inlet_samples: list[float] = []
         self.heating_samples: list[int] = []
         self.pre_flow_inlet: float | None = None
-        self._last_idle_inlet: float | None = None  # tracks inlet when no flow
+        self.recirc_samples: list[int] = []
+        self._idle_inlet_history: list[float] = []  # recent idle inlet readings
+        self._IDLE_HISTORY_MAX = 10  # keep last ~5 min at 30s polling
+        self._last_event_end: datetime | None = None  # for gap calculation
 
     def update(self, now: datetime, flow_rate: float,
                inlet_temp: float | None = None,
@@ -105,7 +279,9 @@ class UsageTracker:
                recirc_on: bool = False):
         # Track inlet temp when idle (no flow) for pre-flow baseline
         if flow_rate < FLOW_THRESHOLD_GPM and inlet_temp is not None:
-            self._last_idle_inlet = inlet_temp
+            self._idle_inlet_history.append(inlet_temp)
+            if len(self._idle_inlet_history) > self._IDLE_HISTORY_MAX:
+                self._idle_inlet_history.pop(0)
 
         if flow_rate >= FLOW_THRESHOLD_GPM and not self.in_event:
             # Flow started — snapshot pre-flow inlet
@@ -115,7 +291,8 @@ class UsageTracker:
             self.flow_samples = [flow_rate]
             self.inlet_samples = [inlet_temp] if inlet_temp is not None else []
             self.heating_samples = [heating] if heating is not None else []
-            self.pre_flow_inlet = self._last_idle_inlet
+            self.recirc_samples = [1 if recirc_on else 0]
+            self.pre_flow_inlet = max(self._idle_inlet_history) if self._idle_inlet_history else None
 
         elif flow_rate >= FLOW_THRESHOLD_GPM and self.in_event:
             # Flow continuing — accumulate samples
@@ -125,6 +302,7 @@ class UsageTracker:
                 self.inlet_samples.append(inlet_temp)
             if heating is not None:
                 self.heating_samples.append(heating)
+            self.recirc_samples.append(1 if recirc_on else 0)
 
         elif flow_rate < FLOW_THRESHOLD_GPM and self.in_event:
             # Flow ended — classify and record
@@ -177,6 +355,11 @@ class UsageTracker:
                   f"{duration:.0f}s | peak {self.peak_flow:.1f} GPM | "
                   f"avg {avg_flow:.1f} GPM{detail_str}")
 
+            self._last_event_end = now
+
+            if event_type == "demand" and self.on_demand:
+                self.on_demand(event_type, fixture_type, duration, avg_flow, detail_str)
+
     # Flow rates that clearly indicate a fixture, not the pump.
     # The recirc pump runs at 2.7-3.2 GPM. Anything well below that
     # during a schedule window is a real fixture (shower ~1.4, faucet varies).
@@ -200,54 +383,78 @@ class UsageTracker:
     def _classify(self) -> str:
         """Classify a completed flow event as 'demand' or 'recirc'.
 
-        Classification strategy:
-        1. If we're in a recirc schedule window, default to 'recirc' UNLESS:
-           a. Flow rate is clearly non-pump (< 2.5 GPM avg = shower/faucet), OR
-           b. Inlet temp crashed from a warm pre-flow baseline (someone drew
-              water, cold supply entering — the pump alone doesn't do this
-              when the loop was already warm).
-        2. Outside schedule windows, use the multi-signal approach:
-           inlet temp, heating state, and flow variance.
+        Rules derived from 2 weeks of sensor data (513 events), cross-
+        referenced with ecobee occupancy:
+
+        1. Drop > 20F AND pre-flow >= 100F -> DEMAND
+           Pipes were warm, cold water rushed in = someone opened a tap.
+
+        2. Flow < 2.0 GPM -> DEMAND
+           Pump never runs this slow. Definitely a fixture.
+
+        3. Flow 2.0-2.5 GPM -> AMBIGUOUS (pump runs slow sometimes):
+           a. Drop > 20F -> DEMAND (cold inrush overrides flow ambiguity)
+           b. Drop <= 20F AND gap < 30 min -> RECIRC (pump running slow)
+           c. Drop <= 20F AND pre-flow < 80F -> RECIRC (cold-start, slow)
+           d. Drop <= 10F -> RECIRC (tiny drop = normal cooldown)
+           e. Otherwise -> DEMAND (can't rule it out)
+
+        4. Flow >= 2.5 GPM AND drop <= 20F -> RECIRC (pump rate, normal)
+
+        5. Flow >= 2.5 GPM AND drop > 20F AND pre >= 100F -> DEMAND
+           Someone drew water at high flow during pump cycle.
+
+        6. Flow >= 2.5 GPM AND drop > 20F AND pre < 80F AND gap > 60m
+           -> RECIRC (pump cold-start after schedule gap)
         """
         avg_flow = sum(self.flow_samples) / len(self.flow_samples)
 
-        # Schedule-aware classification
-        if self.event_start and self._in_recirc_schedule(self.event_start):
-            # Signal A: Flow rate clearly below pump rate
-            if avg_flow < self.PUMP_FLOW_MIN:
-                return "demand"
-
-            # Signal B: Inlet temp crashed from warm baseline
-            # Real demand: pre-flow 115F → min 60F (drop 55F)
-            # Recirc reheat: pre-flow 110F → min 105F (drop 5F)
-            if (self.pre_flow_inlet is not None
-                    and self.pre_flow_inlet >= self.PRE_FLOW_WARM
-                    and self.inlet_samples):
-                min_inlet = min(self.inlet_samples)
-                drop = self.pre_flow_inlet - min_inlet
-                if drop >= self.INLET_DROP_THRESHOLD:
-                    return "demand"
-
-            return "recirc"
-
-        # Outside schedule: use sensor signals (any one = demand)
-        # Signal 1: Cold water entering
-        if self.inlet_samples:
+        # Calculate inlet drop
+        drop = None
+        if self.pre_flow_inlet is not None and self.inlet_samples:
             min_inlet = min(self.inlet_samples)
-            if min_inlet < self.INLET_COLD_THRESHOLD:
-                return "demand"
+            drop = self.pre_flow_inlet - min_inlet
 
-        # Signal 2: Burner fired
-        if self.heating_samples and any(h == 1 for h in self.heating_samples):
+        has_big_drop = drop is not None and drop > self.INLET_DROP_THRESHOLD
+        pre_warm = (self.pre_flow_inlet is not None
+                    and self.pre_flow_inlet >= self.PRE_FLOW_WARM)
+        pre_cold = (self.pre_flow_inlet is not None
+                    and self.pre_flow_inlet < self.PRE_FLOW_COLD)
+
+        # Gap since last event
+        gap_min = 9999
+        if self._last_event_end is not None and self.event_start is not None:
+            gap_min = (self.event_start - self._last_event_end).total_seconds() / 60
+
+        # Rule 1: Warm pipes + big drop = someone drew water
+        if has_big_drop and pre_warm:
             return "demand"
 
-        # Signal 3: Flow rate variance (recirc is rock-steady)
-        if len(self.flow_samples) > 2:
-            import statistics
-            flow_sd = statistics.stdev(self.flow_samples)
-            if flow_sd > self.FLOW_VARIANCE_THRESHOLD:
-                return "demand"
+        # Rule 2: Definitely not the pump
+        if avg_flow < self.PUMP_FLOW_MIN:
+            return "demand"
 
+        # Rule 3: Ambiguous zone (2.0-2.5 GPM)
+        if avg_flow < self.PUMP_FLOW_AMBIG:
+            if has_big_drop:
+                return "demand"   # 3a: cold inrush overrides
+            if gap_min < 30:
+                return "recirc"   # 3b: short gap = pump slow
+            if pre_cold:
+                return "recirc"   # 3c: cold-start, slow
+            if drop is not None and drop <= 10:
+                return "recirc"   # 3d: tiny drop = cooldown
+            return "demand"       # 3e: can't rule out
+
+        # Rule 5: Pump-rate flow + big drop from warm pipes
+        if has_big_drop and pre_warm:
+            return "demand"
+
+        # Rule 6: Pump cold-start after long gap
+        if has_big_drop and pre_cold and gap_min > self.LONG_GAP_MIN:
+            return "recirc"
+
+        # Rule 4: Pump-rate flow, small/no drop
         return "recirc"
 
     def _identify_fixture(self, event_type: str, duration: float,
@@ -287,84 +494,3 @@ class UsageTracker:
             return "faucet"
 
         return "faucet"
-
-
-async def fetch_state(session: aiohttp.ClientSession, entity_id: str) -> str | None:
-    url = f"{HA_URL}/api/states/{entity_id}"
-    headers = {"Authorization": f"Bearer {HA_TOKEN}"}
-    try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("state")
-    except Exception as e:
-        print(f"[WARN] Failed to fetch {entity_id}: {e}")
-    return None
-
-
-def safe_float(val: str | None) -> float | None:
-    if val is None or val in ("unavailable", "unknown"):
-        return None
-    try:
-        return float(val)
-    except ValueError:
-        return None
-
-
-def safe_bool(val: str | None) -> int | None:
-    if val is None or val in ("unavailable", "unknown"):
-        return None
-    return 1 if val == "on" else 0
-
-
-async def collect_loop():
-    conn = init_db()
-    tracker = UsageTracker(conn)
-
-    print(f"[START] Smart Recirc collector polling every {POLL_INTERVAL_SEC}s")
-    print(f"[START] Database: {DB_PATH}")
-
-    async with aiohttp.ClientSession() as session:
-        while True:
-            now = datetime.now(timezone.utc)
-
-            # Fetch all sensors in parallel
-            flow_raw, inlet_raw, outlet_raw, heating_raw, recirc_raw = await asyncio.gather(
-                fetch_state(session, ENTITY_FLOW_RATE),
-                fetch_state(session, ENTITY_INLET_TEMP),
-                fetch_state(session, ENTITY_OUTLET_TEMP),
-                fetch_state(session, ENTITY_HEATING),
-                fetch_state(session, ENTITY_RECIRC),
-            )
-
-            flow = safe_float(flow_raw)
-            inlet = safe_float(inlet_raw)
-            outlet = safe_float(outlet_raw)
-            heating = safe_bool(heating_raw)
-            recirc = safe_bool(recirc_raw)
-
-            # Store raw reading
-            conn.execute("""
-                INSERT INTO sensor_readings
-                    (timestamp, flow_rate, inlet_temp, outlet_temp, heating, recirc_on)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (now.isoformat(), flow, inlet, outlet, heating, recirc))
-            conn.commit()
-
-            # Track usage events
-            if flow is not None:
-                tracker.update(now, flow, inlet_temp=inlet, heating=heating)
-
-            if flow is not None and flow >= FLOW_THRESHOLD_GPM:
-                print(f"[FLOW] {now.strftime('%H:%M:%S')} | "
-                      f"{flow:.1f} GPM | inlet={inlet}°F | outlet={outlet}°F")
-
-            await asyncio.sleep(POLL_INTERVAL_SEC)
-
-
-def main():
-    asyncio.run(collect_loop())
-
-
-if __name__ == "__main__":
-    main()

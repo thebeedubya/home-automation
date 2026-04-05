@@ -2,28 +2,32 @@
 
 import os
 
-HA_URL = os.environ.get("HA_URL", "http://192.168.1.98:8123")
-HA_TOKEN = os.environ["HA_TOKEN"]  # Long-lived access token from Home Assistant
-
-# Rinnai entity IDs
-ENTITY_FLOW_RATE = "sensor.main_house_water_flow_rate"
-ENTITY_INLET_TEMP = "sensor.main_house_inlet_temperature"
-ENTITY_OUTLET_TEMP = "sensor.main_house_outlet_temperature"
-ENTITY_HEATING = "binary_sensor.main_house_heating"
-ENTITY_RECIRC = "binary_sensor.main_house_recirculation"
-ENTITY_RECIRC_SWITCH = "switch.main_house_recirculation"
-ENTITY_WATER_HEATER = "water_heater.main_house_water_heater"
+# Rinnai Cloud API (direct, no HA middleman)
+RINNAI_EMAIL = os.environ.get("RINNAI_EMAIL", "brad@wonderingwoods.com")
+RINNAI_PASSWORD = os.environ.get("RINNAI_PASSWORD", "wodrih-0dordu-fykViw")
+RINNAI_API_KEY = os.environ.get("RINNAI_API_KEY", "da2-dm2g4rqvjbaoxcpo4eccs3k5he")
+RINNAI_GRAPHQL_URL = "https://s34ox7kri5dsvdr43bfgp6qh6i.appsync-api.us-east-1.amazonaws.com/graphql"
+RINNAI_SHADOW_URL = "https://698suy4zs3.execute-api.us-east-1.amazonaws.com/Prod/thing/%s/shadow"
+RINNAI_THING_NAME = os.environ.get("RINNAI_THING_NAME", "CR_a1c82cf1-0add-6e96-3d08-980d3c3bb0f4")
 
 # Prediction parameters
 FLOW_THRESHOLD_GPM = 0.1          # Minimum flow to count as "using hot water"
 PREDICTION_HORIZON_MIN = 5        # How far ahead to predict (minutes)
-RECIRC_DURATION_MIN = 5           # How long to run recirc pump when triggered
+RECIRC_DURATION_MIN = 5           # How long to run recirc pump when predicted
+REACTIVE_RECIRC_MIN = 10          # How long to run recirc on cold inrush detection
 CONFIDENCE_THRESHOLD = 0.6        # Minimum confidence to trigger recirc
-POLL_INTERVAL_SEC = 30            # How often to poll HA for sensor data
+POLL_INTERVAL_SEC = 30            # How often to poll for sensor data
+
+# Telegram bot
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8625837955:AAE-WXYWGvd5isnDaClA5pcIZpemKprYmh0")
+TELEGRAM_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "8367124313"))
 
 # Data collection
 DB_PATH = "smart_recirc.db"
 MIN_TRAINING_DAYS = 3             # Minimum days of data before enabling predictions
+
+# Raw API flow rate conversion: raw value / 10 = GPM through heater
+FLOW_RAW_DIVISOR = 10.0
 
 # Rinnai recirc schedule — windows when the pump cycles automatically.
 # During these windows, flow events default to "recirc" unless flow rate
